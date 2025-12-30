@@ -1,0 +1,6 @@
+attention:
+  batch_size: 8
+
+benchmark:
+  warmup_iterations: 20
+  benchmark_iterations: 100
