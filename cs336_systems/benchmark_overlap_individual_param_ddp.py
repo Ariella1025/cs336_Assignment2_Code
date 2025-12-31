@@ -6,7 +6,7 @@ import torch.distributed as dist
 import cs336_basics_myself
 import torch.multiprocessing as mp
 from load_configs import load_config
-
+from cs336_systems.overlap_individual_parameters_ddp import overlap_individual_parameters_ddp
 
 def setup(rank, world_size, backend = "nccl"):
     """各设备初始化"""
@@ -42,6 +42,9 @@ def parallel_main(rank, world_size, data, num_steps, args, results):
                         theta=getattr(args, "rope_theta"),
                         device=getattr(args, "device")
                     ).to(getattr(args, "device"))
+        
+        # ddp打包模型
+        ddp_model = overlap_individual_parameters_ddp(model)
 
         # 初始化优化器
         optimizer = cs336_basics_myself.AdamW(
@@ -52,85 +55,54 @@ def parallel_main(rank, world_size, data, num_steps, args, results):
         )
 
         # 保证模型同步
-        for param in model.parameters():
+        for param in ddp_model.module.parameters():
             dist.broadcast(param.data, src=0)
 
         print(f"Rank{rank}进行预热")
 
         # warmup
-        model.train()
+        ddp_model.train()
         for _ in range(10):
             optimizer.zero_grad()
-            output = model(local_data)
+            output = ddp_model(local_data)
             loss = output.mean()
             loss.backward()
-
-            # 原实现: 完成所有梯度计算后再逐个all-reduce, 需要产生较大的零碎通信开销
-            # for param in model.parameters():
-            #     if param.grad is None:
-            #         continue
-            #     dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-            #     param.grad /= world_size
-
-            # 将梯度拼接成一个大张量后all-reduce, 减少通信开销
-            # 按照顺序进行组合
-            grads = torch._utils._flatten_dense_tensors([param.grad for param in model.parameters() if param.grad is not None])
-            params = [param for param in model.parameters() if param.grad is not None]
-            dist.all_reduce(grads, op=dist.ReduceOp.SUM)
-            grads /= world_size
-
-            # 将all-reduce后的大张量拆分回各个参数的梯度
-            # 将对应的梯度值复制回各个参数, 按照顺序进行拆分
-            for param, grad in zip(params, 
-                                   torch._utils._unflatten_dense_tensors(grads, [param.grad for param in params])):
-                param.grad.copy_(grad)
-
+            ddp_model.finish_gradient_synchronization()
             optimizer.step()
 
-        # 各设备训练(计算损失后, 得到梯度并进行all-reduce同步, 再更新参数)
-        model.train()
-        times = {"grad": [], "allreduce": [], "step": []}
+        # 正式计时
+        times = {"grad and allreduce": [], "wait": [], "step": []}
         print(f"Rank{rank}进行训练")
         for i in range(num_steps):
             print(f"Rank{rank}进行第 {i}步")
             start_time = timeit.default_timer()
             optimizer.zero_grad()
-            output = model(local_data)
-            # 与单卡路径保持同一梯度尺度：对本地 batch 做平均，再 all-reduce 平均
+            output = ddp_model(local_data)
             loss = output.mean()
-            # 梯度传播
             loss.backward()
-            end_grad_time = timeit.default_timer()
-            grad_time = (end_grad_time - start_time) * 1000
-            times["grad"].append(grad_time)
+            end_grad_and_allreduce_time = timeit.default_timer()
+            grad_and_allreduce_time = (end_grad_and_allreduce_time - start_time) * 1000
+            times["grad and allreduce"].append(grad_and_allreduce_time)
 
-            # all-reduce同步梯度
-            # 将梯度拼接成一个大张量后all-reduce, 减少通信开销
-            # 按照顺序进行组合
-            grads = torch._utils._flatten_dense_tensors([param.grad for param in model.parameters() if param.grad is not None])
-            params = [param for param in model.parameters() if param.grad is not None]
-            dist.all_reduce(grads, op=dist.ReduceOp.SUM)
-            grads /= world_size
+            ddp_model.finish_gradient_synchronization()
+            # 平均参数梯度
+            for param in ddp_model.module.parameters():
+                if param.grad is None:
+                    continue
+                param.grad /= world_size  # 平均梯度
+            end_wait_time = timeit.default_timer()
+            wait_time = (end_wait_time - end_grad_and_allreduce_time) * 1000
+            times["wait"].append(wait_time)
 
-            # 将all-reduce后的大张量拆分回各个参数的梯度
-            # 将对应的梯度值复制回各个参数, 按照顺序进行拆分
-            for param, grad in zip(params, 
-                                   torch._utils._unflatten_dense_tensors(grads, [param.grad for param in params])):
-                param.grad.copy_(grad)
-            end_allreduce_time = timeit.default_timer()
-            allreduce_time = (end_allreduce_time - end_grad_time) * 1000
-            times["allreduce"].append(allreduce_time)
-
-            # 更新参数
             optimizer.step()
             end_step_time = timeit.default_timer()
-            step_time = (end_step_time - end_allreduce_time) * 1000
+            step_time = (end_step_time - end_wait_time) * 1000
             times["step"].append(step_time)
 
         # 收集设备0的计时参数
         if rank == 0:
-            results["grad"] = sum(times["grad"]) / len(times["grad"])
-            results["allreduce"] = sum(times["allreduce"]) / len(times["allreduce"])
+            results["grad and allreduce"] = sum(times["grad and allreduce"]) / len(times["grad and allreduce"])
+            results["wait"] = sum(times["wait"]) / len(times["wait"])
             results["step"] = sum(times["step"]) / len(times["step"])
 
         dist.barrier()
@@ -173,8 +145,8 @@ def main():
     allreduce_times = results["allreduce"]
     step_times = results["step"]
 
-    print(f"平均梯度计算时间: {grad_times:.2f} ms"
-          f", 平均all-reduce时间: {allreduce_times:.2f} ms"
+    print(f"平均梯度计算和传播时间: {grad_times:.2f} ms"
+          f", 平均等待时间: {allreduce_times:.2f} ms"
           f", 平均参数更新时间: {step_times:.2f} ms")
 
 if __name__ == "__main__":
