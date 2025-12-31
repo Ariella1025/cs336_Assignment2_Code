@@ -6,7 +6,7 @@ import torch.distributed as dist
 import cs336_basics_myself
 import torch.multiprocessing as mp
 from load_configs import load_config
-from cs336_systems.overlap_individual_parameters_ddp import overlap_individual_parameters_ddp
+from cs336_systems.overlap_bucketed_ddp import overlap_bucketed_ddp
 
 
 def setup(rank, world_size, backend="nccl"):
@@ -47,7 +47,7 @@ def parallel_main(rank, world_size, data, num_steps, args, results):
         ).to(getattr(args, "device"))
 
         # ddp打包模型
-        ddp_model = overlap_individual_parameters_ddp(model)
+        ddp_model = overlap_bucketed_ddp(model, bucket_size_mb=1000)
 
         # 初始化优化器
         optimizer = cs336_basics_myself.AdamW(
