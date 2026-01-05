@@ -94,7 +94,7 @@ def benchmark_attention_with_timeit(
     # 增大 Dynamo 缓存，避免多形态（no_grad/grad、不同尺寸）触发回退
     torch._dynamo.config.cache_size_limit = 64
 
-    # 编译：尝试多个后端（优先 aot_eager 避免 triton 依赖 -> eager）；全部失败则抛错
+    # 编译
     selected_backend = "uncompiled"
     compile_error: Exception | None = None
     if is_compile:
